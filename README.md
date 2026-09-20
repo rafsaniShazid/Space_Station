@@ -1,6 +1,6 @@
 # Interactive Space Station Simulator
 
-Stage 4 is a small C++ OpenGL and FreeGLUT scene. It creates a perspective 3D window, basic lighting, a dark space background, and a station assembled from cubes, cylinders, spheres, docking ports, solar panels, and a hierarchical robotic arm.
+Stage 6 is a small C++ OpenGL and FreeGLUT scene. It creates a perspective 3D window, basic lighting, a dark space background, and a station assembled from cubes, cylinders, spheres, docking ports, solar panels, and a hierarchical robotic arm.
 
 ## Prerequisites
 
@@ -45,9 +45,16 @@ If Windows reports a missing DLL, run the executable from the MSYS2 UCRT64 termi
 - `W` / `S`: raise or lower the shoulder joint
 - `Q` / `E`: bend or extend the elbow joint
 - `Z`: reset robotic-arm joints
+- `Space`: pause or resume animation
+- `N`: start spacecraft docking
+- `B`: reset the spacecraft docking sequence
+- Left mouse drag: orbit the camera
+- Mouse wheel: zoom in or out
 
 When enabled, the transformation examples demonstrate scaling, reflection, shearing through `glMultMatrixf`, and composite translation/rotation/scaling transformations.
 
 The robotic arm uses nested `glPushMatrix()` / `glPopMatrix()` blocks, so shoulder and elbow transformations affect all child segments and the end-effector.
 
-Stage 5 features such as continuous animation, spacecraft docking, satellite orbiting, and moving debris are intentionally not implemented yet.
+The timer continuously rotates the solar panels, orbits the satellite, moves debris, and advances the spacecraft docking sequence. Docking doors open progressively as the spacecraft approaches the station.
+
+The overlay inside the application repeats the most important controls and shows whether animation is active or paused.
