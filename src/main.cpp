@@ -213,6 +213,7 @@ void drawCube(float w, float h, float d) {
     glutSolidCube(1.0f);
     glPopMatrix();
 }
+
 void drawSphere(float r, int slices = 32, int stacks = 24) { gluSphere(gQuadric, r, slices, stacks); }
 void drawDisk(float inner, float outer, int slices = 36) { gluDisk(gQuadric, inner, outer, slices, 1); }
 void drawTorus(float tube, float ring, int sides = 14, int rings = 40) { glutSolidTorus(tube, ring, sides, rings); }
@@ -933,43 +934,6 @@ ArmFrames computeArmFrames() {
 }
 Vec3 armToolPosition() { return computeArmFrames().tool.point(Vec3(0, 0.05f, 0)); }
 
-void drawRoboticArm() {
-    const ArmFrames f = computeArmFrames();
-    glPushMatrix();
-    glTranslatef(0, 1.3f, 2.8f);
-    glRotatef(-90.0f, 1, 0, 0);
-    setMaterial(0.42f, 0.46f, 0.52f, 40.0f, 0.6f);
-    drawTube(0.75f, 0.35f, true, 32);
-    glPopMatrix();
-    { MatrixScope s(f.turret); setMaterial(0.90f, 0.52f, 0.16f, 60.0f, 0.7f); drawSphere(0.5f, 28, 18); }
-    { MatrixScope s(f.upper);
-      setMaterial(0.36f, 0.40f, 0.46f, 40.0f, 0.5f);
-      glPushMatrix(); glTranslatef(0, 0, -0.3f); drawTube(0.36f, 0.6f, true, 24); glPopMatrix();
-      setMaterial(0.80f, 0.82f, 0.86f, 50.0f, 0.6f);
-      glPushMatrix(); glTranslatef(0, 1.4f, 0); drawCube(0.36f, 2.8f, 0.36f); glPopMatrix();
-      setMaterial(0.90f, 0.52f, 0.16f, 50.0f, 0.6f);
-      glPushMatrix(); glTranslatef(0.26f, 1.2f, 0); drawCube(0.08f, 1.9f, 0.08f); glPopMatrix(); }
-    { MatrixScope s(f.fore);
-      setMaterial(0.90f, 0.52f, 0.16f, 60.0f, 0.7f);
-      drawSphere(0.36f, 24, 16);
-      setMaterial(0.80f, 0.82f, 0.86f, 50.0f, 0.6f);
-      glPushMatrix(); glTranslatef(0, 1.2f, 0); drawCube(0.30f, 2.4f, 0.30f); glPopMatrix(); }
-    { MatrixScope s(f.hand);
-      setMaterial(0.36f, 0.40f, 0.46f, 40.0f, 0.5f);
-      drawSphere(0.26f, 20, 14);
-      setMaterial(0.90f, 0.52f, 0.16f, 50.0f, 0.6f);
-      glPushMatrix(); glTranslatef(0, 0.36f, 0); drawCube(0.40f, 0.48f, 0.50f); glPopMatrix(); }
-    { MatrixScope s(f.tool);
-      setMaterial(0.55f, 0.58f, 0.64f, 40.0f, 0.6f);
-      glPushMatrix(); glTranslatef(0, 0.02f, 0); drawCube(0.30f, 0.10f, 0.90f); glPopMatrix();
-      setMaterial(0.85f, 0.87f, 0.90f, 60.0f, 0.7f);
-      for (int side = -1; side <= 1; side += 2) {                 // gripper fingers slide apart
-          const float z = side * (0.08f + 0.32f * arm.grip);
-          glPushMatrix(); glTranslatef(0, 0.36f, z); drawCube(0.14f, 0.62f, 0.09f); glPopMatrix();
-      }
-      setMaterial(1.0f, 0.4f, 0.2f, 8.0f, 0.0f, 0.9f);
-      glPushMatrix(); glTranslatef(0, 0.02f, 0); drawSphere(0.06f, 10, 8); glPopMatrix(); }
-}
 
 void drawSpaceStation() {
     glCallList(gListTruss);
@@ -983,7 +947,6 @@ void drawSpaceStation() {
     glPushMatrix(); glTranslatef(0, 0, PortBaseZ); drawDockingAdapter(hatchOpen); glPopMatrix();
     drawLabModules();
     drawBeacons();
-    drawRoboticArm();
 }
 
 // ============================================================================
@@ -1021,9 +984,6 @@ Vec3 randomUnit() {
     return Vec3(r * std::cos(a), r * std::sin(a), z);
 }
 
-// ---------------------------------------------------------------------------
-// Docking spacecraft: flight path + state machine
-// ---------------------------------------------------------------------------
 
 const Vec3 PathP0(13.0f, 8.0f, ParkZ);           // parking position
 const Vec3 PathP1(9.0f, 4.0f, 28.0f);
@@ -1049,336 +1009,24 @@ void shipPath(float s, Vec3& pos, Vec3& fwd) {
     }
 }
 
-void updateShipFrame() {
-    Vec3 pos, f;
-    shipPath(dockS, pos, f);
-    const float bob = clampf(1.0f - dockS * 6.0f, 0.0f, 1.0f);       // gentle drift while parked
-    pos.y += 0.18f * std::sin(simTime * 0.9f) * bob;
-    pos.x += 0.10f * std::sin(simTime * 0.6f) * bob;
-    const Vec3 right = normalize(cross(f, Vec3(0.0f, 1.0f, 0.0f)));
-    const Vec3 up = cross(right, f);
-    shipRoll = 22.0f * (1.0f - smooth01((dockS - 0.35f) / 0.65f));   // rolls level during the approach
-    shipFrame = Mat4::basis(right, up, f * -1.0f, pos) * Mat4::rotationZ(shipRoll);
-    shipPos = pos;
-    shipZ = pos.z;
-}
-
 void toast(const char* text, float seconds = 2.5f) {
     std::strncpy(toastText, text, sizeof(toastText) - 1);
     toastText[sizeof(toastText) - 1] = '\0';
     toastTimer = seconds;
 }
 
-const char* dockStateName() {
-    switch (dockState) {
-    case DOCK_PARKED:    return "PARKED";
-    case DOCK_APPROACH:  return "APPROACH";
-    case DOCK_FINAL:     return "FINAL APPROACH";
-    case DOCK_DOCKED:    return hatchOpen > 0.98f ? "DOCKED - HATCHES OPEN" : "DOCKED - HARD CAPTURE";
-    case DOCK_DEPARTING: return "DEPARTING";
-    }
-    return "";
-}
 
-void dockCommand() {                                   // key N
-    switch (dockState) {
-    case DOCK_PARKED:    dockState = DOCK_APPROACH; toast("Docking sequence started"); break;
-    case DOCK_APPROACH:
-    case DOCK_FINAL:     dockState = DOCK_DEPARTING; toast("Docking aborted - backing away"); break;
-    case DOCK_DOCKED:    dockState = DOCK_DEPARTING; toast("Closing hatches, undocking"); break;
-    case DOCK_DEPARTING: dockState = (dockS > 1.0f) ? DOCK_FINAL : DOCK_APPROACH; toast("Resuming approach"); break;
-    }
-}
 
-void resetDocking() {                                  // key B
-    dockState = DOCK_PARKED; dockS = 0.0f; hatchOpen = 0.0f;
-    thrustMain = thrustBrake = 0.0f;
-    toast("Spacecraft returned to parking orbit");
-}
 
-void updateDocking(float dt) {
-    const float span = HoldZ - DockZ;
-    float tMain = 0.0f, tBrake = 0.0f;
-    switch (dockState) {
-    case DOCK_PARKED:
-        dockS = 0.0f;
-        break;
-    case DOCK_APPROACH:
-        dockS += dt / ApproachSeconds;
-        tMain = dockS < 0.55f ? 1.0f : 0.0f;
-        tBrake = dockS >= 0.55f ? 1.0f : 0.0f;
-        if (dockS >= 1.0f) { dockS = 1.0f; dockState = DOCK_FINAL; toast("Hold point reached - final approach"); }
-        break;
-    case DOCK_FINAL: {
-        float d = span * (2.0f - dockS);
-        const float v = clampf(0.18f + 0.32f * d, 0.20f, 1.4f);       // slows down as it closes in
-        d -= v * dt;
-        if (v > 0.35f) tBrake = 0.55f + 0.45f * std::sin(simTime * 11.0f);
-        if (d <= 0.005f) {
-            d = 0.0f; dockState = DOCK_DOCKED; dockedTimer = 0.0f;
-            toast("Hard capture - opening hatches");
-        }
-        dockS = 2.0f - d / span;
-        break; }
-    case DOCK_DOCKED:
-        dockS = 2.0f;
-        dockedTimer += dt;
-        hatchOpen = moveToward(hatchOpen, 1.0f, dt / 2.5f);
-        break;
-    case DOCK_DEPARTING:
-        if (hatchOpen > 0.0f) {
-            hatchOpen = moveToward(hatchOpen, 0.0f, dt / 2.0f);          // close the hatches first
-        } else if (dockS > 1.0f) {
-            float d = span * (2.0f - dockS);
-            const float v = clampf(0.20f + 0.5f * d, 0.20f, 1.6f);
-            d += v * dt;
-            dockS = 2.0f - d / span;
-            if (dockS < 1.0f) dockS = 1.0f;
-            tBrake = 1.0f;
-        } else {
-            dockS -= dt / ApproachSeconds;
-            if (dockS > 0.45f) tBrake = 1.0f; else tMain = 1.0f;
-            if (dockS <= 0.0f) { dockS = 0.0f; dockState = DOCK_PARKED; toast("Spacecraft back in parking orbit"); }
-        }
-        break;
-    }
-    if (dockState != DOCK_DOCKED && dockState != DOCK_DEPARTING) hatchOpen = moveToward(hatchOpen, 0.0f, dt / 1.0f);
-    thrustMain = moveToward(thrustMain, tMain, dt * 4.0f);
-    thrustBrake = moveToward(thrustBrake, tBrake, dt * 4.0f);
-}
 
-// ---------------------------------------------------------------------------
-// Spacecraft model. Local -Z is the nose; the mating face is at z = -ShipNoseLength.
-// ---------------------------------------------------------------------------
-void drawShipHatch(float open) {
-    // nose plate with the hatch aperture (faces -Z)
-    glPushMatrix();
-    glTranslatef(0, 0, -2.73f);
-    glRotatef(180.0f, 0, 1, 0);
-    setMaterial(0.55f, 0.58f, 0.64f, 40.0f, 0.6f);
-    drawDisk(0.42f, 0.72f);
-    glPopMatrix();
-    glPushMatrix();                                            // orange capture ring
-    glTranslatef(0, 0, -2.64f);
-    setMaterial(0.92f, 0.52f, 0.14f, 50.0f, 0.7f);
-    drawTorus(0.09f, 0.75f, 12, 36);
-    glPopMatrix();
-    const float glow = 0.2f + 0.8f * smooth01(open);
-    setMaterial(0.95f, 0.62f, 0.25f, 8.0f, 0.0f, glow);       // lit tunnel behind the doors
-    glPushMatrix(); glTranslatef(0, 0, -2.0f); glRotatef(180.0f, 0, 1, 0); drawDisk(0.0f, 0.42f, 24); glPopMatrix();
-    const float slide = 0.44f * smooth01(open);               // doors slide apart (translation)
-    setMaterial(0.66f, 0.68f, 0.74f, 30.0f, 0.6f);
-    glPushMatrix(); glTranslatef(+slide, 0, -2.66f); glRotatef(180.0f, 0, 1, 0); drawHalfDisc(0.46f, +1); glPopMatrix();
-    glPushMatrix(); glTranslatef(-slide, 0, -2.66f); glRotatef(180.0f, 0, 1, 0); drawHalfDisc(0.46f, -1); glPopMatrix();
-}
 
-void drawShipBody() {
-    // nose collar tube, nose cone, main hull, aft cone
-    setMaterial(0.55f, 0.58f, 0.64f, 40.0f, 0.6f);
-    glPushMatrix(); glTranslatef(0, 0, -2.73f); drawTube(0.72f, 0.63f, false, 32); glPopMatrix();
-    setMaterial(0.94f, 0.95f, 0.97f, 60.0f, 0.7f);
-    glPushMatrix(); glTranslatef(0, 0, -2.1f); drawCone(0.72f, 1.15f, 1.1f, false, 36); glPopMatrix();
-    glPushMatrix();
-    glTranslatef(0, 0, -1.0f);
-    beginTexture(gTexHull, 12.0f, 3.0f);
-    drawTube(1.15f, 2.6f, false, 40);
-    endTexture();
-    glTranslatef(0, 0, 2.6f);
-    drawCone(1.15f, 0.85f, 0.4f, true, 36);
-    glPopMatrix();
-    // blue livery bands
-    setMaterial(0.10f, 0.30f, 0.75f, 50.0f, 0.6f);
-    glPushMatrix(); glTranslatef(0, 0, -0.65f); drawTorus(0.05f, 1.155f, 8, 44); glPopMatrix();
-    glPushMatrix(); glTranslatef(0, 0, 1.15f);  drawTorus(0.05f, 1.155f, 8, 44); glPopMatrix();
-    // cockpit windows
-    setMaterial(0.10f, 0.35f, 0.55f, 90.0f, 0.9f, 0.55f);
-    for (int i = 0; i < 4; ++i) {
-        glPushMatrix(); glRotatef(45.0f + i * 90.0f, 0, 0, 1); glTranslatef(0.93f, 0, -1.55f);
-        glRotatef(-24.0f, 0, 1, 0); drawCube(0.08f, 0.30f, 0.34f); glPopMatrix();
-    }
-    // RCS blocks around the nose cone
-    setMaterial(0.40f, 0.43f, 0.48f, 30.0f, 0.4f);
-    for (int i = 0; i < 4; ++i) {
-        glPushMatrix(); glRotatef(i * 90.0f, 0, 0, 1); glTranslatef(1.18f, 0, -0.95f); drawCube(0.2f, 0.2f, 0.32f); glPopMatrix();
-    }
-    // fin + blinking beacon
-    setMaterial(0.94f, 0.95f, 0.97f, 40.0f, 0.5f);
-    glPushMatrix(); glTranslatef(0, 1.42f, 1.15f); drawCube(0.06f, 0.55f, 1.1f); glPopMatrix();
-    const bool blink = std::sin(simTime * 6.0f) > 0.0f;
-    setMaterial(1.0f, 0.1f, 0.1f, 8.0f, 0.0f, blink ? 1.0f : 0.15f);
-    glPushMatrix(); glTranslatef(0, 1.72f, 1.15f); drawSphere(0.07f, 10, 8); glPopMatrix();
-    // solar wings: struts + textured blades lying in the XZ plane
-    for (int side = -1; side <= 1; side += 2) {
-        setMaterial(0.40f, 0.43f, 0.48f, 30.0f, 0.4f);
-        glPushMatrix(); glTranslatef(side * 1.1f, 0, 0.5f); glRotatef(side * 90.0f, 0, 1, 0); drawTube(0.05f, 0.5f, true, 8); glPopMatrix();
-        glPushMatrix();
-        glTranslatef(side * 2.65f, 0, 0.5f);
-        glRotatef(-90.0f, 1, 0, 0);
-        drawSolarBlade(2.2f, 1.3f, 4.0f, 2.0f);
-        glPopMatrix();
-    }
-    // engine bell (custom lathe mesh, scaled and flipped to open toward +Z)
-    glPushMatrix();
-    glTranslatef(0, 0, 2.0f);
-    glRotatef(180.0f, 0, 1, 0);
-    glScalef(0.45f, 0.45f, 0.45f);
-    setMaterial(0.26f, 0.28f, 0.32f, 60.0f, 0.8f);
-    gMesh.nozzle.draw();
-    glPopMatrix();
-}
 
-void drawShipFlames() {
-    if (thrustMain < 0.02f && thrustBrake < 0.02f) return;
-    GlowScope glow;
-    const float flick = 0.85f + 0.15f * std::sin(simTime * 53.0f) + 0.05f * std::sin(simTime * 31.0f);
-    if (thrustMain > 0.02f) {
-        glPushMatrix();
-        glTranslatef(0, 0, 2.62f);
-        const float L = 3.2f * thrustMain * flick;
-        glColor4f(1.0f, 0.45f, 0.12f, 0.45f);  drawCone(0.42f, 0.0f, L, false, 20);
-        glColor4f(1.0f, 0.85f, 0.45f, 0.75f);  drawCone(0.22f, 0.0f, L * 0.6f, false, 20);
-        glPopMatrix();
-    }
-    if (thrustBrake > 0.02f) {
-        for (int i = 0; i < 4; ++i) {
-            glPushMatrix();
-            glRotatef(i * 90.0f, 0, 0, 1); glTranslatef(1.18f, 0, -1.11f);
-            glRotatef(180.0f, 1, 0, 0);
-            glColor4f(0.75f, 0.85f, 1.0f, 0.6f);
-            drawCone(0.09f, 0.0f, 0.9f * thrustBrake * flick, false, 10);
-            glPopMatrix();
-        }
-    }
-}
 
-void drawShip() {
-    MatrixScope frame(shipFrame);
-    drawShipBody();
-    drawShipHatch(hatchOpen);
-    drawShipFlames();
-}
 
-// ---------------------------------------------------------------------------
-// Orbiting satellite (own orbit frame -> body -> wings / dish : three-level hierarchy)
-// ---------------------------------------------------------------------------
-const float SatOrbitR = 27.0f, SatTilt = 32.0f;
-
-void updateSatellite() {
-    satFrame = Mat4::rotationX(SatTilt) * Mat4::rotationY(satAngle) * Mat4::translation(SatOrbitR, 0.0f, 0.0f);
-    satPos = satFrame.point(Vec3(0, 0, 0));
-}
-
-void drawSatellite() {
-    MatrixScope frame(satFrame);
-    setMaterial(0.80f, 0.82f, 0.86f, 50.0f, 0.6f);
-    beginTexture(gTexHull, 2.0f, 2.0f);
-    drawCube(1.1f, 1.1f, 1.5f);
-    endTexture();
-    setMaterial(0.85f, 0.65f, 0.15f, 60.0f, 0.8f);                 // gold thermal foil
-    glPushMatrix(); glTranslatef(0.0f, 0.0f, 0.0f); drawCube(1.14f, 0.5f, 1.54f); glPopMatrix();
-    setMaterial(0.40f, 0.43f, 0.48f, 30.0f, 0.4f);
-    glPushMatrix(); glRotatef(90.0f, 1, 0, 0); glRotatef(90.0f, 0, 1, 0); glTranslatef(0, 0, -2.2f); drawTube(0.05f, 4.4f, true, 8); glPopMatrix();
-    for (int side = -1; side <= 1; side += 2) {                    // wings rotate about their long (Z) axis
-        glPushMatrix();
-        glRotatef(solarAngle * 0.5f, 0, 0, 1);
-        glTranslatef(0, 0, side * 2.0f);
-        glRotatef(90.0f, 1, 0, 0);
-        drawSolarBlade(1.5f, 2.3f, 3.0f, 5.0f);
-        glPopMatrix();
-    }
-    glPushMatrix();                                                // relay dish facing the station (-X)
-    glTranslatef(-0.55f, 0, 0); glRotatef(-90.0f, 0, 1, 0); glScalef(0.3f, 0.3f, 0.3f);
-    setMaterial(0.92f, 0.93f, 0.96f, 60.0f, 0.7f);
-    gMesh.dish.draw();
-    glPopMatrix();
-    setMaterial(0.25f, 0.27f, 0.32f, 30.0f, 0.4f);                 // sensor barrel on the far side
-    glPushMatrix(); glTranslatef(0.55f, 0, 0); glRotatef(90.0f, 0, 1, 0); drawTube(0.2f, 0.6f, true, 16); glPopMatrix();
-    const bool blink = std::sin(simTime * 3.0f) > 0.6f;
-    setMaterial(0.2f, 1.0f, 0.4f, 8.0f, 0.0f, blink ? 1.0f : 0.1f);
-    glPushMatrix(); glTranslatef(0, 0.6f, 0); drawSphere(0.07f, 10, 8); glPopMatrix();
-}
-
-// ---------------------------------------------------------------------------
-// Space debris: random-walk drift with soft boundaries and collision avoidance
-// ---------------------------------------------------------------------------
-void initDebris() {
-    debris.clear();
-    for (int i = 0; i < 16; ++i) {
-        Debris d;
-        d.pos = randomUnit() * gRng.range(16.0f, 32.0f);
-        d.vel = randomUnit() * gRng.range(0.4f, 1.2f);
-        d.axis = randomUnit();
-        d.angle = gRng.range(0.0f, 360.0f);
-        d.spin = gRng.range(-45.0f, 45.0f);
-        d.size = gRng.range(0.35f, 0.9f);
-        d.retarget = gRng.range(3.0f, 9.0f);
-        d.kind = i % 4;
-        debris.push_back(d);
-    }
-}
-
-void updateDebris(float dt) {
-    for (size_t i = 0; i < debris.size(); ++i) {
-        Debris& d = debris[i];
-        d.retarget -= dt;
-        if (d.retarget <= 0.0f) {                                  // pick a new random drift direction
-            d.retarget = gRng.range(4.0f, 10.0f);
-            d.vel = d.vel * 0.5f + randomUnit() * gRng.range(0.3f, 1.0f);
-        }
-        const float r = length(d.pos);
-        if (r > 34.0f) d.vel = d.vel + d.pos * (-1.5f * dt / r);   // soft outer leash
-        if (r < 15.0f) d.vel = d.vel + d.pos * (4.0f * dt / (r + 0.01f));   // keep-out zone around the station
-        const Vec3 fromShip = d.pos - shipPos;
-        const float ds = length(fromShip);
-        if (ds < 5.0f) d.vel = d.vel + fromShip * (6.0f * dt / (ds + 0.1f));
-        const Vec3 fromSat = d.pos - satPos;
-        const float dq = length(fromSat);
-        if (dq < 5.0f) d.vel = d.vel + fromSat * (6.0f * dt / (dq + 0.1f));
-        const float sp = length(d.vel);
-        if (sp > 1.6f) d.vel = d.vel * (1.6f / sp);
-        d.pos = d.pos + d.vel * dt;
-        d.angle += d.spin * dt;
-    }
-}
-
-void drawDebris() {
-    for (size_t i = 0; i < debris.size(); ++i) {
-        const Debris& d = debris[i];
-        glPushMatrix();
-        glTranslatef(d.pos.x, d.pos.y, d.pos.z);
-        glRotatef(d.angle, d.axis.x, d.axis.y, d.axis.z);
-        if (d.kind < 3) {
-            const float t = 0.85f + 0.3f * hash01((int)i, 3, 5);
-            setMaterial(0.42f * t, 0.34f * t, 0.28f * t, 10.0f, 0.12f);
-            glScalef(d.size, d.size, d.size);
-            gMesh.asteroid[d.kind].draw();
-        } else {                                                   // torn-off solar panel
-            glScalef(d.size * 1.6f, d.size * 1.6f, d.size * 1.6f);
-            setMaterial(0.70f, 0.72f, 0.76f, 60.0f, 0.7f);
-            drawCube(1.0f, 0.04f, 0.6f);
-            setMaterial(0.05f, 0.12f, 0.35f, 90.0f, 0.9f);
-            glPushMatrix(); glTranslatef(0.0f, 0.025f, 0.0f); drawCube(0.9f, 0.01f, 0.5f); glPopMatrix();
-        }
-        glPopMatrix();
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Planet, atmosphere, stars, sun
 // ---------------------------------------------------------------------------
-void drawEarth() {
-    glPushMatrix();
-    glTranslatef(EarthPos.x, EarthPos.y, EarthPos.z);
-    glRotatef(23.4f, 0, 0, 1);                                     // axial tilt
-    glRotatef(-90.0f, 1, 0, 0);                                    // sphere poles: Z -> Y
-    glRotatef(earthSpin, 0, 0, 1);                                 // daily rotation
-    setMaterial(1.0f, 1.0f, 1.0f, 14.0f, 0.15f);
-    beginTexture(gTexEarth);
-    drawSphere(EarthRadius, 96, 64);
-    endTexture();
-    glPopMatrix();
-}
-
 void drawAtmosphere() {                                            // camera-facing gradient ring around the limb
     const Vec3 toCam = camEye - EarthPos;
     const float d = length(toCam);
@@ -1508,11 +1156,9 @@ void drawGuides() {
     // satellite orbit
     glColor4f(0.55f, 1.0f, 0.65f, 0.55f);
     glPushMatrix();
-    glMultMatrixf(Mat4::rotationX(SatTilt).m);
     glBegin(GL_LINE_LOOP);
     for (int i = 0; i < 120; ++i) {
         const float a = 2.0f * PI * i / 120;
-        glVertex3f(SatOrbitR * std::cos(a), 0, -SatOrbitR * std::sin(a));
     }
     glEnd();
     glPopMatrix();
@@ -1546,11 +1192,8 @@ void updateSimulation(float dt) {
     // solar wings turn smoothly toward the sun when tracking is on
     const float sunTarget = degrees(std::atan2(-SunDir.y, SunDir.z));
     solarTrackAngle += wrap180(sunTarget - solarTrackAngle) * (1.0f - std::exp(-dt * 1.5f));
+ 
 
-    updateSatellite();
-    updateDocking(dt);
-    updateShipFrame();
-    updateDebris(dt);
 
     // antenna gimbal follows the satellite (azimuth then elevation)
     const Vec3 d = normalize(satPos - DishPivot);
@@ -1889,7 +1532,6 @@ void drawStationHUD() {
 
     hudPanel(12.0f, 12.0f, 440.0f, 100.0f);
     glColor3f(0.55f, 0.85f, 1.0f);  hudText(24.0f, 34.0f, big, "SPACE STATION SIMULATOR");
-    glColor3f(1.0f, 0.82f, 0.35f);  hudText(24.0f, 54.0f, med, "Spacecraft: %s", dockStateName());
     const float range = length(shipPos - Vec3(0.0f, 0.0f, DockZ));
     const char* thr = thrustMain > 0.05f ? "MAIN ENGINE" : (thrustBrake > 0.05f ? "RCS BRAKE" : "off");
     glColor3f(0.9f, 0.95f, 1.0f);
@@ -2035,16 +1677,13 @@ void display() {
     glLightfv(GL_LIGHT1, GL_POSITION, earthshine);
 
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    drawSky();
+    // drawSky();
     glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
     if (labMode) {
         drawLab();
     } else {
-        drawEarth();
         drawSpaceStation();
-        drawSatellite();
-        drawDebris();
-        drawShip();
+        // drawShip();
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         drawAtmosphere();
         if (showGuides) drawGuides();
@@ -2193,8 +1832,6 @@ void keyboard(unsigned char key, int, int) {
     }
     if (k >= '1' && k <= '6') setPreset(k - '0');
     else if (k == 'r') setPreset(1);
-    else if (k == 'n') dockCommand();
-    else if (k == 'b') resetDocking();
     else if (k == 'p') { solarTracking = !solarTracking; toast(solarTracking ? "Solar wings track the sun" : "Solar wings spinning freely", 1.8f); }
     else if (k == 'z') { arm = ArmHome; toast("Robotic arm reset", 1.2f); }
 }
@@ -2304,11 +1941,8 @@ void initGL(bool multisample) {
     gListRing = glGenLists(1);
     glNewList(gListRing, GL_COMPILE); drawHabitatRingStatic(); glEndList();
 
-    initDebris();
     probe.scale = 0.9f;
     labEnterDemo(0);
-    updateSatellite();
-    updateShipFrame();
     solarTrackAngle = degrees(std::atan2(-SunDir.y, SunDir.z));
     cam = camGoal;
     camTarget = cam.target;
@@ -2336,7 +1970,6 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--preset") && i + 1 < argc) { camPresetId = std::atoi(argv[++i]); if (camPresetId >= 1 && camPresetId <= 6) setPreset(camPresetId); }
         else if (!std::strcmp(argv[i], "--lab") && i + 1 < argc) { enterLab(true); labEnterDemo(std::atoi(argv[++i]) - 1); }
-        else if (!std::strcmp(argv[i], "--dock")) dockCommand();
         else if (!std::strcmp(argv[i], "--skip") && i + 1 < argc) skipSeconds = (float)std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--shot") && i + 2 < argc) { screenshotAfterFrames = std::atoi(argv[++i]); std::snprintf(screenshotPath, sizeof(screenshotPath), "%s", argv[++i]); }
         else if (!std::strcmp(argv[i], "--nohelp")) showHelp = false;
