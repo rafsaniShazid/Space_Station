@@ -615,7 +615,6 @@ const float PortBaseZ = 4.5f;                          // adapter starts on the 
 const float AdapterLength = 1.23f;                     // adapter + collar length
 const float PortFaceZ = PortBaseZ + AdapterLength;     // station mating face
 const float ShipNoseLength = 2.73f;                    // ship origin -> ship mating face
-const float DockZ = PortFaceZ + ShipNoseLength;        // ship origin when docked
 const float HoldZ = 16.0f;                             // final-approach hold point
 const float ParkZ = 36.0f;                             // parking position
 
@@ -657,12 +656,6 @@ Vec3 satPos;
 Mat4 satFrame;
 float dishYaw = 0.0f, dishPitch = 0.0f;
 
-// docking state machine
-enum DockState { DOCK_PARKED, DOCK_APPROACH, DOCK_FINAL, DOCK_DOCKED, DOCK_DEPARTING };
-DockState dockState = DOCK_PARKED;
-float shipZ = ParkZ, hatchOpen = 0.0f, dockedTimer = 0.0f;
-Vec3 shipPos(0.0f, 0.0f, ParkZ);
-float shipRoll = 0.0f, thrustMain = 0.0f, thrustBrake = 0.0f;
 
 // robotic arm (all angles in degrees; grip is the open fraction 0..1)
 struct ArmState { float base, shoulder, elbow, wrist, grip; };
@@ -689,41 +682,6 @@ GLuint gListStars = 0, gListTruss = 0, gListRing = 0;
 // ============================================================================
 // 5. STATION GEOMETRY (modelled with primitives, meshes and hierarchical transforms)
 // ============================================================================
-
-// Docking adapter. Local +Z is the mating direction; it occupies z in [0, 1.23].
-// `open` (0..1) slides two half-disc hatch doors apart (translation) revealing a lit tunnel.
-void drawDockingAdapter(float open) {
-    setMaterial(0.76f, 0.78f, 0.82f, 40.0f, 0.6f);
-    beginTexture(gTexHull, 8.0f, 1.0f);
-    drawTube(1.1f, 1.0f, false);
-    endTexture();
-
-    glPushMatrix();                                   // front plate with the hatch aperture
-    glTranslatef(0, 0, 1.0f);
-    setMaterial(0.55f, 0.58f, 0.64f, 40.0f, 0.6f);
-    drawDisk(0.5f, 1.1f);
-    glPopMatrix();
-
-    glPushMatrix();                                   // docking collar
-    glTranslatef(0, 0, 1.1f);
-    setMaterial(0.92f, 0.52f, 0.14f, 50.0f, 0.7f);
-    drawTorus(0.13f, 0.80f, 14, 40);
-    glPopMatrix();
-
-    const float glow = 0.25f + 0.75f * smooth01(open);   // tunnel brightens as the hatch opens
-    setMaterial(0.95f, 0.62f, 0.25f, 8.0f, 0.0f, glow);
-    glPushMatrix();
-    glTranslatef(0, 0, 0.7f);
-    drawTube(0.5f, 0.3f, false, 24);
-    glRotatef(180.0f, 1, 0, 0);
-    drawDisk(0.0f, 0.5f, 24);
-    glPopMatrix();
-
-    const float slide = 0.52f * smooth01(open);       // hatch doors: pure translation along X
-    setMaterial(0.66f, 0.68f, 0.74f, 30.0f, 0.6f);
-    glPushMatrix(); glTranslatef(+slide, 0, 0.85f); drawHalfDisc(0.56f, +1); glPopMatrix();
-    glPushMatrix(); glTranslatef(-slide, 0, 0.85f); drawHalfDisc(0.56f, -1); glPopMatrix();
-}
 
 // Main truss (static geometry, compiled into a display list).
 void drawTrussStatic() {
@@ -944,7 +902,6 @@ void drawSpaceStation() {
     glRotatef(ringAngle, 0, 0, 1);
     glCallList(gListRing);
     glPopMatrix();
-    glPushMatrix(); glTranslatef(0, 0, PortBaseZ); drawDockingAdapter(hatchOpen); glPopMatrix();
     drawLabModules();
     drawBeacons();
 }
@@ -991,7 +948,6 @@ const Vec3 PathP2(0.0f, 0.0f, HoldZ + 9.0f);
 const Vec3 PathP3(0.0f, 0.0f, HoldZ);            // hold point, exactly on the docking axis
 const float ApproachSeconds = 16.0f;
 
-float dockS = 0.0f;       // path parameter: 0 parked .. 1 hold point .. 2 docked
 float shipSpeed = 0.0f;
 Mat4 shipFrame;
 
@@ -1004,7 +960,6 @@ void shipPath(float s, Vec3& pos, Vec3& fwd) {
         fwd = normalize((PathP1 - PathP0) * (3.0f * v * v) + (PathP2 - PathP1) * (6.0f * v * u) +
                         (PathP3 - PathP2) * (3.0f * u * u));
     } else {
-        pos = Vec3(0.0f, 0.0f, lerpf(HoldZ, DockZ, s - 1.0f));
         fwd = Vec3(0.0f, 0.0f, -1.0f);
     }
 }
@@ -1027,31 +982,6 @@ void toast(const char* text, float seconds = 2.5f) {
 // ---------------------------------------------------------------------------
 // Planet, atmosphere, stars, sun
 // ---------------------------------------------------------------------------
-void drawAtmosphere() {                                            // camera-facing gradient ring around the limb
-    const Vec3 toCam = camEye - EarthPos;
-    const float d = length(toCam);
-    if (d < EarthRadius * 1.05f) return;
-    const Vec3 n = toCam * (1.0f / d);
-    const Vec3 center = EarthPos + n * (EarthRadius * EarthRadius / d);
-    const float r = EarthRadius * std::sqrt(1.0f - EarthRadius * EarthRadius / (d * d));
-    Vec3 right = cross(Vec3(0, 1, 0), n);
-    if (length(right) < 1e-3f) right = Vec3(1, 0, 0);
-    right = normalize(right);
-    const Vec3 up = cross(n, right);
-    GlowScope glow;
-    glBegin(GL_TRIANGLE_STRIP);
-    const int N = 120;
-    for (int i = 0; i <= N; ++i) {
-        const float a = 2.0f * PI * i / N;
-        const Vec3 dir = right * std::cos(a) + up * std::sin(a);
-        const float lit = clampf(0.30f + 0.85f * dot(dir, SunDir) + 0.25f, 0.18f, 1.0f);
-        const Vec3 in = center + dir * (r * 0.990f), out = center + dir * (r * 1.085f);
-        glColor4f(0.30f, 0.55f, 1.0f, 0.65f * lit);  glVertex3f(in.x, in.y, in.z);
-        glColor4f(0.20f, 0.40f, 1.0f, 0.0f);         glVertex3f(out.x, out.y, out.z);
-    }
-    glEnd();
-}
-
 void buildStars() {
     gListStars = glGenLists(1);
     glNewList(gListStars, GL_COMPILE);
@@ -1184,8 +1114,8 @@ void drawGuides() {
 // ---------------------------------------------------------------------------
 void updateSimulation(float dt) {
     simTime += dt;
-    ringAngle = std::fmod(ringAngle + 6.0f * dt, 360.0f);
-    solarAngle = std::fmod(solarAngle + 20.0f * dt, 360.0f);
+    ringAngle = std::fmod(ringAngle + 0.0f * dt, 360.0f);
+    solarAngle = std::fmod(solarAngle + 0.0f * dt, 360.0f);
     earthSpin = std::fmod(earthSpin + 1.2f * dt, 360.0f);
     satAngle = std::fmod(satAngle + 9.0f * dt, 360.0f);
 
@@ -1532,13 +1462,10 @@ void drawStationHUD() {
 
     hudPanel(12.0f, 12.0f, 440.0f, 100.0f);
     glColor3f(0.55f, 0.85f, 1.0f);  hudText(24.0f, 34.0f, big, "SPACE STATION SIMULATOR");
-    const float range = length(shipPos - Vec3(0.0f, 0.0f, DockZ));
-    const char* thr = thrustMain > 0.05f ? "MAIN ENGINE" : (thrustBrake > 0.05f ? "RCS BRAKE" : "off");
     glColor3f(0.9f, 0.95f, 1.0f);
-    hudText(24.0f, 72.0f, med, "Range %.2f m    Speed %.2f m/s    Thrust: %s", range, shipSpeed, thr);
     hudText(24.0f, 90.0f, med, "View: %s    FPS %.0f%s", chaseCamera ? PresetNames[5] : (camPresetId ? PresetNames[camPresetId] : "FREE"),
             fpsValue, paused ? "    [PAUSED]" : "");
-    if (dockState == DOCK_DOCKED && hatchOpen > 0.98f) { glColor3f(0.5f, 1.0f, 0.6f); hudText(24.0f, 106.0f, med, "Press N to undock"); }
+    
 
     static const char* const help[] = {
         "Mouse  L-drag orbit  R-drag/wheel zoom  M-drag pan",
@@ -1683,9 +1610,7 @@ void display() {
         drawLab();
     } else {
         drawSpaceStation();
-        // drawShip();
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-        drawAtmosphere();
         if (showGuides) drawGuides();
     }
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
@@ -1785,9 +1710,7 @@ void tick(int) {
 
     processHeldInput(dt);
     if (!paused) {
-        const Vec3 before = shipPos;
         updateSimulation(dt);
-        if (dt > 1e-5f) shipSpeed = lerpf(shipSpeed, length(shipPos - before) / dt, 0.15f);
         labTime += dt;
     }
     updateLab(dt);
