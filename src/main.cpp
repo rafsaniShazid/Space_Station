@@ -11,6 +11,9 @@
  *    Code::Blocks / Dev-C++ : link freeglut, opengl32, glu32 (in that order).
  *
  *  WHERE EACH PROPOSAL OBJECTIVE LIVES IN THE CODE
+ *    Lighting (ambient/diffuse/
+ *    specular, two lights) ....... setMaterial() + glLightfv() calls, section 2 and initGL()
+ *    Phong shading (per-pixel) .... GLSL shader in section 2b (kPhongVertexShader/kPhongFragmentShader)
  *    Primitives + custom meshes ... section 2/3 (cube, sphere, cylinder, torus, and
  *                                    hand-built meshes: lathe dish/nozzle, asteroid, probe)
  *    Translate/rotate/scale/
@@ -43,9 +46,16 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>   // must come before GL headers on Windows; also brings in wglGetProcAddress
+#else
+#define GL_GLEXT_PROTOTYPES   // Linux: libGL.so exports these directly, so prototypes alone are enough to link
 #endif
 
 #include <GL/freeglut.h>
+#include <GL/glext.h>   // always included for the PFNGL...PROC typedefs, used below on Windows
 
 #include <algorithm>
 #include <cmath>
@@ -72,6 +82,70 @@
 #endif
 
 namespace {
+
+#ifdef _WIN32
+// ============================================================================
+// 0. WINDOWS GL FUNCTION LOADING
+// ============================================================================
+//  opengl32.dll on Windows only exports OpenGL 1.1 directly - everything newer (including every
+//  shader-related call used in section 2b) has to be fetched manually at run time with
+//  wglGetProcAddress, then called through a function pointer. These pointer variables are given
+//  the SAME names as the real GL functions via #define, so the rest of this file (compileShader(),
+//  initPhongShader(), beginTexture(), etc.) calls glCreateShader(...) exactly as it would on Linux
+//  and never needs to know the difference.
+static PFNGLCREATESHADERPROC        p_glCreateShader = nullptr;
+static PFNGLSHADERSOURCEPROC        p_glShaderSource = nullptr;
+static PFNGLCOMPILESHADERPROC       p_glCompileShader = nullptr;
+static PFNGLGETSHADERIVPROC         p_glGetShaderiv = nullptr;
+static PFNGLGETSHADERINFOLOGPROC    p_glGetShaderInfoLog = nullptr;
+static PFNGLCREATEPROGRAMPROC       p_glCreateProgram = nullptr;
+static PFNGLATTACHSHADERPROC        p_glAttachShader = nullptr;
+static PFNGLLINKPROGRAMPROC         p_glLinkProgram = nullptr;
+static PFNGLGETPROGRAMIVPROC        p_glGetProgramiv = nullptr;
+static PFNGLGETPROGRAMINFOLOGPROC   p_glGetProgramInfoLog = nullptr;
+static PFNGLUSEPROGRAMPROC          p_glUseProgram = nullptr;
+static PFNGLGETUNIFORMLOCATIONPROC  p_glGetUniformLocation = nullptr;
+static PFNGLUNIFORM1IPROC           p_glUniform1i = nullptr;
+
+#define glCreateShader        p_glCreateShader
+#define glShaderSource        p_glShaderSource
+#define glCompileShader       p_glCompileShader
+#define glGetShaderiv         p_glGetShaderiv
+#define glGetShaderInfoLog    p_glGetShaderInfoLog
+#define glCreateProgram       p_glCreateProgram
+#define glAttachShader        p_glAttachShader
+#define glLinkProgram         p_glLinkProgram
+#define glGetProgramiv        p_glGetProgramiv
+#define glGetProgramInfoLog   p_glGetProgramInfoLog
+#define glUseProgram          p_glUseProgram
+#define glGetUniformLocation  p_glGetUniformLocation
+#define glUniform1i           p_glUniform1i
+
+// Must be called AFTER glutCreateWindow() (wglGetProcAddress needs a current GL context), and
+// before initPhongShader(). If any pointer comes back null the matching call becomes a no-op
+// crash risk, so initPhongShader()'s own ok-checks still catch a bad load and fall back safely.
+// A plain C-style cast straight to a PFNGL...PROC type triggers -Wcast-function-type (the two
+// function-pointer types are "incompatible" as far as the compiler can prove); routing through
+// void* first is the standard way every GL loader, including GLEW, avoids that warning.
+template <typename FnPtr>
+FnPtr getGLProc(const char* name) { return reinterpret_cast<FnPtr>(reinterpret_cast<void*>(wglGetProcAddress(name))); }
+
+void loadWindowsGLFunctions() {
+    p_glCreateShader       = getGLProc<PFNGLCREATESHADERPROC>("glCreateShader");
+    p_glShaderSource       = getGLProc<PFNGLSHADERSOURCEPROC>("glShaderSource");
+    p_glCompileShader      = getGLProc<PFNGLCOMPILESHADERPROC>("glCompileShader");
+    p_glGetShaderiv        = getGLProc<PFNGLGETSHADERIVPROC>("glGetShaderiv");
+    p_glGetShaderInfoLog   = getGLProc<PFNGLGETSHADERINFOLOGPROC>("glGetShaderInfoLog");
+    p_glCreateProgram      = getGLProc<PFNGLCREATEPROGRAMPROC>("glCreateProgram");
+    p_glAttachShader       = getGLProc<PFNGLATTACHSHADERPROC>("glAttachShader");
+    p_glLinkProgram        = getGLProc<PFNGLLINKPROGRAMPROC>("glLinkProgram");
+    p_glGetProgramiv       = getGLProc<PFNGLGETPROGRAMIVPROC>("glGetProgramiv");
+    p_glGetProgramInfoLog  = getGLProc<PFNGLGETPROGRAMINFOLOGPROC>("glGetProgramInfoLog");
+    p_glUseProgram         = getGLProc<PFNGLUSEPROGRAMPROC>("glUseProgram");
+    p_glGetUniformLocation = getGLProc<PFNGLGETUNIFORMLOCATIONPROC>("glGetUniformLocation");
+    p_glUniform1i          = getGLProc<PFNGLUNIFORM1IPROC>("glUniform1i");
+}
+#endif  // _WIN32
 
 // ============================================================================
 // 1. MATH: scalars, vectors, and an explicit 4x4 matrix class
@@ -260,7 +334,138 @@ void setMaterial(float r, float g, float b, float shine = 32.0f, float spec = 0.
     glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, shine);
 }
 
+// ============================================================================
+// 2b. PHONG SHADING  (per-pixel lighting, done on the GPU with a GLSL shader)
+// ============================================================================
+//
+//  glShadeModel(GL_SMOOTH) below only turns on GOURAUD shading: OpenGL's
+//  fixed-function pipeline lights each TRIANGLE CORNER once and then blends
+//  ("interpolates") those few colours across the triangle's face. That is fast,
+//  but round shiny highlights come out flat/faceted because the lighting math
+//  never actually runs on the middle of a triangle.
+//
+//  PHONG shading instead interpolates the surface NORMAL across each triangle
+//  and re-runs the full ambient+diffuse+specular lighting equation for every
+//  single on-screen pixel ("fragment"). This needs a small GPU program (a
+//  "shader") because the fixed-function pipeline cannot do per-pixel lighting
+//  by itself. The two tiny programs below are that shader:
+//    - the VERTEX shader runs once per triangle corner: it hands the surface
+//      normal, position and current colour to the next stage instead of
+//      computing a final colour itself.
+//    - the FRAGMENT shader runs once per pixel. When lighting is on it
+//      normalizes the interpolated normal and computes Phong's equation
+//          colour = ambient + diffuse*max(N.L,0) + specular*max(R.V,0)^shininess
+//      for BOTH lights (GL_LIGHT0 the sun, GL_LIGHT1 the faint planet-shine),
+//      using the SAME glMaterial / glLight values set elsewhere in this file
+//      (setMaterial(), glLightfv in initGL) - GLSL's built-in gl_FrontMaterial
+//      / gl_LightSource[] read them automatically, so nothing about how
+//      objects are drawn (section 5 onward) has to change. When lighting is
+//      off (glDisable(GL_LIGHTING), used for the HUD/guides/sky/flames/lab
+//      grid) the shader just outputs the plain glColor value instead, so
+//      those unlit elements still look exactly as before.
+//
+const char* kPhongVertexShader = R"GLSL(
+varying vec3 vNormal;
+varying vec3 vPos;
+varying vec4 vColor;
+void main() {
+    vNormal = gl_NormalMatrix * gl_Normal;              // normal -> eye space
+    vPos = vec3(gl_ModelViewMatrix * gl_Vertex);         // position -> eye space
+    vColor = gl_Color;                                   // current glColor, for the unlit path
+    gl_TexCoord[0] = gl_MultiTexCoord0;                  // pass texture coords through unchanged
+    gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+}
+)GLSL";
+
+const char* kPhongFragmentShader = R"GLSL(
+varying vec3 vNormal;
+varying vec3 vPos;
+varying vec4 vColor;
+uniform sampler2D uTex;
+uniform bool uUseTexture;
+uniform bool uUseLighting;
+vec4 lightContribution(int idx, vec3 N, vec3 V) {
+    vec3 L = normalize(gl_LightSource[idx].position.xyz);
+    vec3 R = reflect(-L, N);
+    float diffFactor = max(dot(N, L), 0.0);
+    vec4 diffuse = gl_FrontMaterial.diffuse * gl_LightSource[idx].diffuse * diffFactor;
+    float specFactor = (diffFactor > 0.0) ? pow(max(dot(R, V), 0.0), gl_FrontMaterial.shininess) : 0.0;
+    vec4 specular = gl_FrontMaterial.specular * gl_LightSource[idx].specular * specFactor;
+    vec4 ambient = gl_FrontMaterial.ambient * gl_LightSource[idx].ambient;
+    return ambient + diffuse + specular;
+}
+void main() {
+    vec4 color;
+    if (uUseLighting) {
+        vec3 N = normalize(vNormal);                         // re-normalize: interpolation shrinks it
+        vec3 V = normalize(-vPos);                            // direction to the eye
+        vec4 ambient = gl_FrontMaterial.ambient * gl_LightModel.ambient;
+        // GL_LIGHT0 (sun) and GL_LIGHT1 (faint planet-shine) are unrolled explicitly rather than
+        // looped over gl_LightSource[i] - some GLSL compilers handle a dynamic loop index into a
+        // built-in array poorly, so two plain calls keep this portable.
+        vec4 lit = lightContribution(0, N, V) + lightContribution(1, N, V);
+        color = ambient + lit + gl_FrontMaterial.emission;
+    } else {
+        color = vColor;                                        // unlit elements: HUD, guides, sky, flames...
+    }
+    if (uUseTexture) color *= texture2D(uTex, gl_TexCoord[0].st);
+    gl_FragColor = color;
+}
+)GLSL";
+
+GLuint gPhongProgram = 0;
+GLint gLocUseTexture = -1;
+GLint gLocUseLighting = -1;
+
+GLuint compileShader(GLenum type, const char* src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, nullptr);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[2048];
+        glGetShaderInfoLog(s, sizeof(log), nullptr, log);
+        std::fprintf(stderr, "Shader compile error:\n%s\n", log);
+    }
+    return s;
+}
+
+// Builds and activates the Phong shader. If anything goes wrong (very old GPU/driver),
+// gPhongProgram stays 0, glUseProgram(0) is a no-op, and rendering quietly falls back
+// to the fixed-function Gouraud lighting instead of crashing.
+void initPhongShader() {
+    GLuint vs = compileShader(GL_VERTEX_SHADER, kPhongVertexShader);
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, kPhongFragmentShader);
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[2048];
+        glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+        std::fprintf(stderr, "Shader link error:\n%s\n", log);
+        return;
+    }
+    gPhongProgram = prog;
+    glUseProgram(gPhongProgram);
+    glUniform1i(glGetUniformLocation(gPhongProgram, "uTex"), 0);   // texture unit 0
+    gLocUseTexture = glGetUniformLocation(gPhongProgram, "uUseTexture");
+    gLocUseLighting = glGetUniformLocation(gPhongProgram, "uUseLighting");
+    glUniform1i(gLocUseTexture, 0);
+    glUniform1i(gLocUseLighting, 1);   // GL_LIGHTING starts enabled (see initGL)
+}
+
+// Thin wrappers so every existing glEnable(GL_LIGHTING)/glDisable(GL_LIGHTING) call in this file
+// also flips the shader's uUseLighting uniform - that's what lets the SAME shader draw both the
+// lit station/ship/satellite/debris AND the unlit HUD/guides/sky/flames correctly.
+void enableLighting() { glEnable(GL_LIGHTING); if (gLocUseLighting >= 0) glUniform1i(gLocUseLighting, 1); }
+void disableLighting() { glDisable(GL_LIGHTING); if (gLocUseLighting >= 0) glUniform1i(gLocUseLighting, 0); }
+
 void beginTexture(GLuint tex, float repeatS = 1.0f, float repeatT = 1.0f) {
+    if (gLocUseTexture >= 0) glUniform1i(gLocUseTexture, 1);
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, tex);
     glMatrixMode(GL_TEXTURE);
@@ -269,6 +474,7 @@ void beginTexture(GLuint tex, float repeatS = 1.0f, float repeatT = 1.0f) {
     glMatrixMode(GL_MODELVIEW);
 }
 void endTexture() {
+    if (gLocUseTexture >= 0) glUniform1i(gLocUseTexture, 0);
     glMatrixMode(GL_TEXTURE);
     glLoadIdentity();
     glMatrixMode(GL_MODELVIEW);
@@ -993,7 +1199,7 @@ void drawSpaceStation() {
 // Additive-blend "light" pass: lighting off, depth writes off. Restores everything on exit.
 struct GlowScope {
     GlowScope() {
-        glDisable(GL_LIGHTING);
+        disableLighting();
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE);
         glDepthMask(GL_FALSE);
@@ -1001,7 +1207,7 @@ struct GlowScope {
     ~GlowScope() {
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
-        glEnable(GL_LIGHTING);
+        enableLighting();
     }
 };
 
@@ -1441,7 +1647,7 @@ void buildStars() {
 }
 
 void drawSky() {
-    glDisable(GL_LIGHTING);
+    disableLighting();
     glDepthMask(GL_FALSE);
     glEnable(GL_POINT_SMOOTH);
     glEnable(GL_BLEND);
@@ -1470,19 +1676,24 @@ void drawSky() {
     glDisable(GL_POINT_SMOOTH);
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
-    glEnable(GL_LIGHTING);
+    enableLighting();
 }
 
 // ---------------------------------------------------------------------------
 // Guides (key O): axis triad, docking corridor, flight path, satellite orbit
 // ---------------------------------------------------------------------------
 void drawText3D(const Vec3& p, const char* s, void* font = GLUT_BITMAP_HELVETICA_12) {
+    // glBitmap-based text bypasses the normal per-vertex pipeline (its position comes from the
+    // raster position, not a glVertex stream), which some drivers' shader codegen cannot handle
+    // while a custom program is bound. Switch to the fixed-function pipeline just for this call.
+    if (gPhongProgram) glUseProgram(0);
     glRasterPos3f(p.x, p.y, p.z);
     for (; *s; ++s) glutBitmapCharacter(font, *s);
+    if (gPhongProgram) glUseProgram(gPhongProgram);
 }
 
 void drawGuides() {
-    glDisable(GL_LIGHTING);
+    disableLighting();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_LINE_SMOOTH);
@@ -1530,7 +1741,7 @@ void drawGuides() {
     glDisable(GL_LINE_SMOOTH);
     glLineWidth(1.0f);
     glDisable(GL_BLEND);
-    glEnable(GL_LIGHTING);
+    enableLighting();
 }
 
 // ---------------------------------------------------------------------------
@@ -1626,7 +1837,7 @@ Mat4 labModel(const LabParams& p, int variant, bool applyMirror) {
 }
 
 void drawLabStage() {
-    glDisable(GL_LIGHTING);
+    disableLighting();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_LINE_SMOOTH);
@@ -1662,11 +1873,11 @@ void drawLabStage() {
     glLineWidth(1.0f);
     glDisable(GL_LINE_SMOOTH);
     glDisable(GL_BLEND);
-    glEnable(GL_LIGHTING);
+    enableLighting();
 }
 
 void drawMirrorPlane() {                                            // translucent, so drawn last and without depth writes
-    glDisable(GL_LIGHTING);
+    disableLighting();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
@@ -1685,12 +1896,12 @@ void drawMirrorPlane() {                                            // transluce
     glLineWidth(1.0f);
     glDisable(GL_LINE_SMOOTH);
     glDisable(GL_BLEND);
-    glEnable(GL_LIGHTING);
+    enableLighting();
 }
 
 void drawWireGhost(const Mat4& M, float r, float g, float b) {
     MatrixScope s(M);
-    glDisable(GL_LIGHTING);
+    disableLighting();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
@@ -1698,14 +1909,14 @@ void drawWireGhost(const Mat4& M, float r, float g, float b) {
     gMesh.probe.draw();
     glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
     glDisable(GL_BLEND);
-    glEnable(GL_LIGHTING);
+    enableLighting();
 }
 
 void drawProbe(const Mat4& M, float r, float g, float b) {
     MatrixScope s(M);                                               // reflection => front-face flip handled here
     setMaterial(r, g, b, 50.0f, 0.5f);
     gMesh.probe.draw();
-    glDisable(GL_LIGHTING);                                         // the probe's own axes go through the same matrix
+    disableLighting();                                         // the probe's own axes go through the same matrix
     glLineWidth(2.5f);
     glBegin(GL_LINES);
     glColor3f(1.0f, 0.3f, 0.3f); glVertex3f(0, 0, 0); glVertex3f(2.9f, 0, 0);
@@ -1713,12 +1924,7 @@ void drawProbe(const Mat4& M, float r, float g, float b) {
     glColor3f(0.4f, 0.55f, 1.0f); glVertex3f(0, 0, 0); glVertex3f(0, 0, 2.9f);
     glEnd();
     glLineWidth(1.0f);
-    glEnable(GL_LIGHTING);
-}
-
-void updateLab(float dt) {
-    probe.mirror = moveToward(probe.mirror, probe.mirrorTarget, dt * 2.0f);   // reflection eases through the mirror plane
-    probe.shear = moveToward(probe.shear, probe.shearTarget, dt * 1.6f);
+    enableLighting();
 }
 
 Mat4 labMainMatrix() { return labModel(labEffective(), 0, true); }
@@ -1729,10 +1935,10 @@ void drawLab() {
     if (labSelected == 3) drawWireGhost(labModel(p, 0, false), 0.6f, 0.85f, 1.0f);      // un-mirrored original
     else if (labSelected != 5) drawWireGhost(Mat4::scaling(probe.scale, probe.scale, probe.scale), 0.6f, 0.85f, 1.0f);
     if (labSelected == 0) {                                          // displacement vector
-        glDisable(GL_LIGHTING);
+        disableLighting();
         glColor3f(1.0f, 0.85f, 0.3f);
         glBegin(GL_LINES); glVertex3f(0, 0, 0); glVertex3f(p.pos.x, p.pos.y, p.pos.z); glEnd();
-        glEnable(GL_LIGHTING);
+        enableLighting();
     }
     drawProbe(labModel(p, 0, true), 0.95f, 0.55f, 0.18f);
     if (labSelected == 5) drawProbe(labModel(p, 1, true), 0.20f, 0.72f, 0.85f);
@@ -1843,7 +2049,7 @@ void enterLab(bool on) {
 void hudBegin() {
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     glDisable(GL_DEPTH_TEST);
-    glDisable(GL_LIGHTING);
+    disableLighting();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
@@ -1854,7 +2060,7 @@ void hudEnd() {
     glMatrixMode(GL_PROJECTION); glPopMatrix();
     glMatrixMode(GL_MODELVIEW); glPopMatrix();
     glDisable(GL_BLEND);
-    glEnable(GL_LIGHTING);
+    enableLighting();
     glEnable(GL_DEPTH_TEST);
 }
 void hudText(float x, float y, void* font, const char* fmt, ...) {
@@ -1863,8 +2069,10 @@ void hudText(float x, float y, void* font, const char* fmt, ...) {
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    if (gPhongProgram) glUseProgram(0);        // see drawText3D: glBitmap text needs the fixed-function pipeline
     glRasterPos2f(x, y);
     for (const char* c = buf; *c; ++c) glutBitmapCharacter(font, *c);
+    if (gPhongProgram) glUseProgram(gPhongProgram);
 }
 void hudPanel(float x, float y, float w, float h, float alpha = 0.62f) {
     glColor4f(0.02f, 0.05f, 0.10f, alpha);
@@ -2085,22 +2293,16 @@ void processHeldInput(float dt) {
         const bool U = specialHeld[GLUT_KEY_UP], D = specialHeld[GLUT_KEY_DOWN];
         const bool PU = specialHeld[GLUT_KEY_PAGE_UP], PD = specialHeld[GLUT_KEY_PAGE_DOWN];
         if (!shiftDown) {
-            if (L) probe.pos.x -= mv;
-            if (R) probe.pos.x += mv;
-            if (U) probe.pos.z -= mv;
-            if (D) probe.pos.z += mv;
-            if (PU) probe.pos.y += mv;
-            if (PD) probe.pos.y -= mv;
+            if (L) probe.pos.x -= mv;  if (R) probe.pos.x += mv;
+            if (U) probe.pos.z -= mv;  if (D) probe.pos.z += mv;
+            if (PU) probe.pos.y += mv; if (PD) probe.pos.y -= mv;
             probe.pos.x = clampf(probe.pos.x, -7.0f, 7.0f);
             probe.pos.y = clampf(probe.pos.y, -1.5f, 5.0f);
             probe.pos.z = clampf(probe.pos.z, -7.0f, 7.0f);
         } else {
-            if (L) probe.yaw += rot;
-            if (R) probe.yaw -= rot;
-            if (U) probe.pitch += rot;
-            if (D) probe.pitch -= rot;
-            if (PU) probe.roll += rot;
-            if (PD) probe.roll -= rot;
+            if (L) probe.yaw += rot;   if (R) probe.yaw -= rot;
+            if (U) probe.pitch += rot; if (D) probe.pitch -= rot;
+            if (PU) probe.roll += rot; if (PD) probe.roll -= rot;
         }
         if (keyHeld[(unsigned char)'.']) probe.scale *= std::exp(dt * 0.9f);
         if (keyHeld[(unsigned char)',']) probe.scale *= std::exp(-dt * 0.9f);
@@ -2151,7 +2353,8 @@ void tick(int) {
         if (dt > 1e-5f) shipSpeed = lerpf(shipSpeed, length(shipPos - before) / dt, 0.15f);
         labTime += dt;
     }
-    updateLab(dt);
+    probe.mirror = moveToward(probe.mirror, probe.mirrorTarget, dt * 2.0f);   // reflection eases through the mirror plane
+    probe.shear = moveToward(probe.shear, probe.shearTarget, dt * 1.6f);
     updateCamera(dt);
     if (toastTimer > 0.0f) toastTimer -= dt;
     glutPostRedisplay();
@@ -2262,8 +2465,11 @@ void mouseWheel(int, int dir, int, int) {
 // ============================================================================
 
 void initGL(bool multisample) {
+#ifdef _WIN32
+    loadWindowsGLFunctions();   // must happen first: initPhongShader() below needs these pointers
+#endif
     glEnable(GL_DEPTH_TEST);
-    glEnable(GL_LIGHTING);
+    enableLighting();
     glEnable(GL_LIGHT0);
     glEnable(GL_LIGHT1);
     glEnable(GL_NORMALIZE);                                          // needed because of glScalef / Mat4 scaling
@@ -2292,6 +2498,8 @@ void initGL(bool multisample) {
     gQuadric = gluNewQuadric();
     gluQuadricNormals(gQuadric, GLU_SMOOTH);
     gluQuadricTexture(gQuadric, GL_TRUE);
+
+    initPhongShader();   // from here on every triangle is lit per-pixel (Phong shading), not per-vertex
 
     gTexHull = makeHullTexture();
     gTexSolar = makeSolarTexture();
@@ -2341,7 +2549,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--shot") && i + 2 < argc) { screenshotAfterFrames = std::atoi(argv[++i]); std::snprintf(screenshotPath, sizeof(screenshotPath), "%s", argv[++i]); }
         else if (!std::strcmp(argv[i], "--nohelp")) showHelp = false;
     }
-    for (float t = 0.0f; t < skipSeconds; t += 1.0f / 60.0f) { updateSimulation(1.0f / 60.0f); updateLab(1.0f / 60.0f); labTime += 1.0f / 60.0f; }
+    for (float t = 0.0f; t < skipSeconds; t += 1.0f / 60.0f) { updateSimulation(1.0f / 60.0f); labTime += 1.0f / 60.0f; }
     if (skipSeconds > 0.0f) {
         for (int i = 0; i < 400; ++i) updateCamera(0.05f);
     }
