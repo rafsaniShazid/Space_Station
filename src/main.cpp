@@ -10,6 +10,18 @@
  *    MinGW   : g++ -std=c++11 space_station_simulator.cpp -o station.exe -lfreeglut -lglu32 -lopengl32
  *    Code::Blocks / Dev-C++ : link freeglut, opengl32, glu32 (in that order).
  *
+ *  WHAT CHANGED IN THIS VERSION
+ *    1. The SPACE STATION now flies a circular orbit AROUND THE EARTH (updateStation(), section 6).
+ *       Everything that belongs to the station (ship, debris, robotic arm, camera) is still modelled in
+ *       the station's own frame, so docking and the arm work exactly as before; the Earth, the
+ *       satellite and the guides are the things that are shifted by -stationPos each frame.
+ *    2. The SATELLITE now orbits the EARTH (own orbit plane, own speed), not the station (updateSatellite()).
+ *       Its relay dish always points at the Earth.
+ *    3. The station's SOLAR WINGS no longer rotate. They are fixed at SolarWingAngle (section 4),
+ *       an angle that faces the sun. (P key removed.)
+ *    4. New camera preset 7: ORBIT OVERVIEW - looks down on the whole orbit so you can watch the
+ *       station and the satellite circle the Earth.
+ *
  *  WHERE EACH PROPOSAL OBJECTIVE LIVES IN THE CODE
  *    Lighting (ambient/diffuse/
  *    specular, two lights) ....... setMaterial() + glLightfv() calls, section 2 and initGL()
@@ -18,25 +30,25 @@
  *                                    hand-built meshes: lathe dish/nozzle, asteroid, probe)
  *    Translate/rotate/scale/
  *    reflect/shear/composite ...... Mat4 class + "TRANSFORMATION LAB" (press T)
- *    Hierarchical transforms ...... 6-DOF robotic arm, rotating solar wings, habitat ring,
- *                                    tracking antenna dish, docking adapter doors
- *    Real-time animation .......... docking spacecraft (state machine), solar wings,
- *                                    orbiting satellite, randomly drifting debris
+ *    Hierarchical transforms ...... 6-DOF robotic arm, habitat ring, tracking antenna dish,
+ *                                    docking adapter doors, orbit frames (Earth -> station -> parts)
+ *    Real-time animation .......... station + satellite orbits, docking spacecraft (state machine),
+ *                                    spinning habitat ring, randomly drifting debris
  *    User interaction ............. keyboard + mouse (see the on-screen help, F1)
  *    Camera/view transformations .. orbit / pan / zoom camera, view presets, chase camera
  *
  *  CONTROLS (case-insensitive)
  *    Mouse   : left-drag orbit | right-drag zoom | middle-drag pan | wheel zoom
- *    Camera  : 1 iso  2 docking axis  3 top  4 aft  5 chase spacecraft  6 robotic arm
+ *    Camera  : 1 iso  2 docking axis  3 top  4 aft  5 chase spacecraft  6 robotic arm  7 orbit overview
  *              arrows orbit | + - zoom | R reset
- *    Sim     : Space pause | N dock / undock | B reset docking | P solar wings: free spin / track sun
+ *    Sim     : Space pause | N dock / undock | B reset docking
  *    Arm     : A/D base   W/S shoulder   Q/E elbow   F/G wrist   C/V gripper   Z reset
  *    View    : T transformation lab | L wireframe | O guides | F1 help | F11 fullscreen | F12 screenshot | Esc quit
  *    Lab (T) : 1-6 or [ ] choose demo | arrows move probe in X/Z | PgUp/PgDn move Y
  *              Shift+arrows/PgUp/PgDn rotate | , . scale | M mirror (reflection) | H shear | Z reset demo
  *
  *  OPTIONAL COMMAND-LINE SWITCHES (for demos / automated screenshots)
- *    --preset N   start in camera preset N (1-6)      --dock       start the docking sequence
+ *    --preset N   start in camera preset N (1-7)      --dock       start the docking sequence
  *    --lab N      open transformation-lab demo N      --skip SEC   fast-forward the simulation
  *    --nohelp     hide the help panel                 --shot FRAMES FILE.bmp   save a screenshot and quit
  * ============================================================================
@@ -814,8 +826,10 @@ const int InitialWidth = 1280;
 const int InitialHeight = 760;
 const float MinCamDist = 6.0f;
 const float MaxCamDist = 90.0f;
+const float OverviewMinDist = 90.0f;     // orbit-overview camera (preset 7) is centred on the Earth,
+const float OverviewMaxDist = 700.0f;    // so it needs a far larger zoom range than the station cameras
 
-// Docking geometry. The station frame equals the world frame and the docking axis is +Z.
+// Docking geometry. The station frame is the "local" frame and the docking axis is +Z.
 const float PortBaseZ = 4.5f;                          // adapter starts on the core here
 const float AdapterLength = 1.23f;                     // adapter + collar length
 const float PortFaceZ = PortBaseZ + AdapterLength;     // station mating face
@@ -825,9 +839,33 @@ const float HoldZ = 16.0f;                             // final-approach hold po
 const float ParkZ = 36.0f;                             // parking position
 
 const Vec3 SunDir = normalize(Vec3(0.85f, 0.45f, 0.30f));   // direction *towards* the sun
-const Vec3 EarthPos(-117.0f, -119.0f, -54.0f);
+const Vec3 EarthPos(-117.0f, -119.0f, -54.0f);              // Earth centre in WORLD space
 const float EarthRadius = 62.0f;
 const Vec3 DishPivot(0.0f, 4.9f, -1.8f);               // antenna gimbal position on the station
+
+// ---- ORBITS ---------------------------------------------------------------------------------
+//  World space: the Earth sits still at EarthPos and the sun is a fixed direction.
+//  The station's own "local" frame (the one every model below is drawn in) is simply the world
+//  frame shifted by stationPos. The station keeps a constant attitude and TRANSLATES along a
+//  circle around the Earth, so seen from the station the Earth, satellite and stars slide past.
+//  At orbit angle 0 the station is at the world origin, exactly where it used to sit.
+const Vec3 StationRadial0 = normalize(Vec3(0.0f, 0.0f, 0.0f) - EarthPos);                 // Earth centre -> station at t = 0
+const float StationOrbitR = length(EarthPos);                                             // orbit radius
+const Vec3 StationTangent0 = normalize(Vec3(0.0f, 0.0f, 1.0f) - StationRadial0 * StationRadial0.z);  // flies toward +Z
+const Vec3 StationNormal = cross(StationRadial0, StationTangent0);                        // orbit-plane normal
+const float StationOmega = 1.0f;                                                          // degrees per second (one lap = 6 min)
+
+// The satellite has its own, differently tilted, lower and faster orbit around the same Earth.
+const Vec3 SatStart(-18.0f, -6.0f, -14.0f);                                               // where it starts (world space)
+const Vec3 SatA = normalize(SatStart - EarthPos);                                         // in-plane axis 1 (start direction)
+const float SatOrbitR = length(SatStart - EarthPos);
+const Vec3 SatHint(0.2f, -1.0f, 0.4f);
+const Vec3 SatB = normalize(SatHint - SatA * dot(SatHint, SatA));                         // in-plane axis 2 (flight direction)
+const Vec3 SatNormal = cross(SatA, SatB);
+const float SatOmega = 1.7f;                                                              // degrees per second
+
+// Fixed (non-rotating) solar wings: this tilt about the truss axis turns the panels to face the sun.
+const float SolarWingAngle = degrees(std::atan2(-SunDir.y, SunDir.z));
 
 // ---- window & camera ----
 int winW = InitialWidth, winH = InitialHeight;
@@ -853,13 +891,16 @@ float fpsValue = 0.0f;
 // ---- animation state ----
 float simTime = 0.0f;
 float ringAngle = 0.0f;               // habitat ring spin
-float solarAngle = 0.0f;              // continuous solar wing rotation
-float solarTrackAngle = 0.0f;         // smoothed sun-tracking angle
-bool solarTracking = false;
+float solarAngle = 0.0f;              // spin of the SATELLITE's wings only (the station's wings are fixed)
 float earthSpin = 0.0f;
-float satAngle = 20.0f;               // orbital phase, degrees
-Vec3 satPos;
-Mat4 satFrame;
+float stationAngle = 0.0f;            // station orbital phase, degrees (0..360)
+int stationOrbits = 0;                // completed laps
+Vec3 stationPos;                      // station position in WORLD space
+Vec3 earthLocal = EarthPos;           // Earth centre in the station's local frame (= EarthPos - stationPos)
+float satAngle = 0.0f;                // satellite orbital phase, degrees
+Vec3 satWorldPos;                     // satellite position in WORLD space
+Vec3 satPos;                          // satellite position in the station's local frame
+Mat4 satFrame;                        // satellite model frame in the station's local frame
 float dishYaw = 0.0f, dishPitch = 0.0f;
 
 // docking state machine
@@ -1016,17 +1057,18 @@ void drawSolarBlade(float w, float l, float tilesU, float tilesV) {
     glDisable(GL_POLYGON_OFFSET_FILL);
 }
 
-// Solar wing: fixed rotary-joint housing -> rotating hub -> two blades (hierarchical transform).
+// Solar wing: rotary-joint housing -> hub -> two blades (hierarchical transform).
+// The station's wings are now FIXED: `angle` is a constant (SolarWingAngle), never animated.
 void drawSolarWing(float side, float angle) {
     glPushMatrix();
     glTranslatef(side * 8.0f, 0, -3.4f);
     setMaterial(0.35f, 0.38f, 0.44f, 40.0f, 0.5f);
     glPushMatrix(); glTranslatef(0, 0, 0); glRotatef(90.0f, 0, 1, 0); glTranslatef(0, 0, -1.4f);
     drawTube(0.42f, 2.8f, true, 24); glPopMatrix();                // housing on the truss
-    glRotatef(angle, 1, 0, 0);                                     // rotation about the truss axis
+    glRotatef(angle, 1, 0, 0);                                     // fixed tilt about the truss axis
     setMaterial(0.80f, 0.60f, 0.20f, 60.0f, 0.7f);
     glPushMatrix(); glRotatef(90.0f, 0, 1, 0); glTranslatef(0, 0, -1.2f);
-    drawTube(0.52f, 2.4f, true, 24); glPopMatrix();                // rotating hub
+    drawTube(0.52f, 2.4f, true, 24); glPopMatrix();                // hub
     for (int s = -1; s <= 1; s += 2) {
         glPushMatrix(); glTranslatef(0, s * 3.05f, 0); drawSolarBlade(2.4f, 5.0f, 5.0f, 10.0f); glPopMatrix();
     }
@@ -1179,8 +1221,8 @@ void drawRoboticArm() {
 
 void drawSpaceStation() {
     glCallList(gListTruss);
-    drawSolarWing(+1.0f, solarTracking ? solarTrackAngle : solarAngle);
-    drawSolarWing(-1.0f, solarTracking ? solarTrackAngle : solarAngle);
+    drawSolarWing(+1.0f, SolarWingAngle);             // both wings are fixed: no rotation animation
+    drawSolarWing(-1.0f, SolarWingAngle);
     drawCoreAndHub();
     glPushMatrix();                                   // the whole ring spins about the station axis
     glRotatef(ringAngle, 0, 0, 1);
@@ -1465,15 +1507,33 @@ void drawShip() {
 }
 
 // ---------------------------------------------------------------------------
-// Orbiting satellite (own orbit frame -> body -> wings / dish : three-level hierarchy)
+// Orbital motion
 // ---------------------------------------------------------------------------
-const float SatOrbitR = 27.0f, SatTilt = 32.0f;
 
-void updateSatellite() {
-    satFrame = Mat4::rotationX(SatTilt) * Mat4::rotationY(satAngle) * Mat4::translation(SatOrbitR, 0.0f, 0.0f);
-    satPos = satFrame.point(Vec3(0, 0, 0));
+// The station flies a circle around the Earth. stationPos is a WORLD-space position; earthLocal is
+// where the Earth is as seen from the station's own frame (everything else is drawn in that frame).
+void updateStation() {
+    const float c = std::cos(radians(stationAngle)), s = std::sin(radians(stationAngle));
+    stationPos = EarthPos + (StationRadial0 * c + StationTangent0 * s) * StationOrbitR;
+    earthLocal = EarthPos - stationPos;
 }
 
+// The satellite flies its own circle around the EARTH (not the station).
+//   world position = Earth centre + orbit radius * (A cos(phase) + B sin(phase))
+// The model frame has +X pointing away from the Earth, so the relay dish at -X always faces the
+// planet. Its WORLD frame is then shifted by -stationPos so it can be drawn in the station's frame.
+void updateSatellite() {
+    const float c = std::cos(radians(satAngle)), s = std::sin(radians(satAngle));
+    const Vec3 radial = SatA * c + SatB * s;
+    satWorldPos = EarthPos + radial * SatOrbitR;
+    const Mat4 world = Mat4::basis(radial, SatNormal, cross(radial, SatNormal), satWorldPos);
+    satFrame = Mat4::translation(-stationPos.x, -stationPos.y, -stationPos.z) * world;
+    satPos = satWorldPos - stationPos;
+}
+
+// ---------------------------------------------------------------------------
+// Orbiting satellite (own orbit frame -> body -> wings / dish : three-level hierarchy)
+// ---------------------------------------------------------------------------
 void drawSatellite() {
     MatrixScope frame(satFrame);
     setMaterial(0.80f, 0.82f, 0.86f, 50.0f, 0.6f);
@@ -1492,7 +1552,7 @@ void drawSatellite() {
         drawSolarBlade(1.5f, 2.3f, 3.0f, 5.0f);
         glPopMatrix();
     }
-    glPushMatrix();                                                // relay dish facing the station (-X)
+    glPushMatrix();                                                // relay dish facing the Earth (-X)
     glTranslatef(-0.55f, 0, 0); glRotatef(-90.0f, 0, 1, 0); glScalef(0.3f, 0.3f, 0.3f);
     setMaterial(0.92f, 0.93f, 0.96f, 60.0f, 0.7f);
     gMesh.dish.draw();
@@ -1574,7 +1634,7 @@ void drawDebris() {
 // ---------------------------------------------------------------------------
 void drawEarth() {
     glPushMatrix();
-    glTranslatef(EarthPos.x, EarthPos.y, EarthPos.z);
+    glTranslatef(earthLocal.x, earthLocal.y, earthLocal.z);        // Earth as seen from the (moving) station
     glRotatef(23.4f, 0, 0, 1);                                     // axial tilt
     glRotatef(-90.0f, 1, 0, 0);                                    // sphere poles: Z -> Y
     glRotatef(earthSpin, 0, 0, 1);                                 // daily rotation
@@ -1586,11 +1646,11 @@ void drawEarth() {
 }
 
 void drawAtmosphere() {                                            // camera-facing gradient ring around the limb
-    const Vec3 toCam = camEye - EarthPos;
+    const Vec3 toCam = camEye - earthLocal;
     const float d = length(toCam);
     if (d < EarthRadius * 1.05f) return;
     const Vec3 n = toCam * (1.0f / d);
-    const Vec3 center = EarthPos + n * (EarthRadius * EarthRadius / d);
+    const Vec3 center = earthLocal + n * (EarthRadius * EarthRadius / d);
     const float r = EarthRadius * std::sqrt(1.0f - EarthRadius * EarthRadius / (d * d));
     Vec3 right = cross(Vec3(0, 1, 0), n);
     if (length(right) < 1e-3f) right = Vec3(1, 0, 0);
@@ -1680,7 +1740,7 @@ void drawSky() {
 }
 
 // ---------------------------------------------------------------------------
-// Guides (key O): axis triad, docking corridor, flight path, satellite orbit
+// Guides (key O): axis triad, docking corridor, flight path, orbit rings around the Earth
 // ---------------------------------------------------------------------------
 void drawText3D(const Vec3& p, const char* s, void* font = GLUT_BITMAP_HELVETICA_12) {
     // glBitmap-based text bypasses the normal per-vertex pipeline (its position comes from the
@@ -1692,54 +1752,100 @@ void drawText3D(const Vec3& p, const char* s, void* font = GLUT_BITMAP_HELVETICA
     if (gPhongProgram) glUseProgram(gPhongProgram);
 }
 
+// Camera-facing ring + label that keeps a constant on-screen size, so the station and the
+// satellite stay findable when the overview camera is hundreds of units away.
+void drawMarker(const Vec3& c, float r, float cr, float cg, float cb, const char* label, float labelUp = 1.3f) {
+    Vec3 right, up;
+    viewAxes(right, up);
+    glLineWidth(2.0f);
+    glColor4f(cr, cg, cb, 0.95f);
+    glBegin(GL_LINE_LOOP);
+    for (int i = 0; i < 40; ++i) {
+        const float a = 2.0f * PI * i / 40;
+        const Vec3 p = c + right * (r * std::cos(a)) + up * (r * std::sin(a));
+        glVertex3f(p.x, p.y, p.z);
+    }
+    glEnd();
+    glLineWidth(1.6f);
+    drawText3D(c + up * (r * labelUp) + right * (r * 0.5f), label);
+}
+
 void drawGuides() {
     disableLighting();
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_LINE_SMOOTH);
     glLineWidth(1.6f);
-    // world axes at the station origin
-    glBegin(GL_LINES);
-    glColor3f(1.0f, 0.3f, 0.3f); glVertex3f(0, 0, 0); glVertex3f(7.5f, 0, 0);
-    glColor3f(0.3f, 1.0f, 0.3f); glVertex3f(0, 0, 0); glVertex3f(0, 7.5f, 0);
-    glColor3f(0.4f, 0.55f, 1.0f); glVertex3f(0, 0, 0); glVertex3f(0, 0, 7.5f);
-    glEnd();
-    glColor3f(1.0f, 0.5f, 0.5f); drawText3D(Vec3(7.9f, 0, 0), "X");
-    glColor3f(0.5f, 1.0f, 0.5f); drawText3D(Vec3(0, 7.9f, 0), "Y");
-    glColor3f(0.6f, 0.7f, 1.0f); drawText3D(Vec3(0, 0, 7.9f), "Z");
+
+    const float stationDist = length(camEye);                  // camera distance from the station
+    const float satDist = length(camEye - satPos);
+    const bool nearStation = stationDist < 90.0f;
+
+    if (nearStation) {
+        // world axes at the station origin
+        glBegin(GL_LINES);
+        glColor3f(1.0f, 0.3f, 0.3f); glVertex3f(0, 0, 0); glVertex3f(7.5f, 0, 0);
+        glColor3f(0.3f, 1.0f, 0.3f); glVertex3f(0, 0, 0); glVertex3f(0, 7.5f, 0);
+        glColor3f(0.4f, 0.55f, 1.0f); glVertex3f(0, 0, 0); glVertex3f(0, 0, 7.5f);
+        glEnd();
+        glColor3f(1.0f, 0.5f, 0.5f); drawText3D(Vec3(7.9f, 0, 0), "X");
+        glColor3f(0.5f, 1.0f, 0.5f); drawText3D(Vec3(0, 7.9f, 0), "Y");
+        glColor3f(0.6f, 0.7f, 1.0f); drawText3D(Vec3(0, 0, 7.9f), "Z");
+    }
     // docking corridor and flight path (dashed)
     glEnable(GL_LINE_STIPPLE);
     glLineStipple(2, 0x00FF);
-    glColor4f(1.0f, 0.75f, 0.25f, 0.8f);
-    glBegin(GL_LINES); glVertex3f(0, 0, PortFaceZ); glVertex3f(0, 0, HoldZ); glEnd();
-    glColor4f(0.45f, 0.9f, 1.0f, 0.65f);
-    glBegin(GL_LINE_STRIP);
-    for (int i = 0; i <= 60; ++i) { Vec3 p, f; shipPath(i / 60.0f, p, f); glVertex3f(p.x, p.y, p.z); }
-    glEnd();
-    // satellite orbit
-    glColor4f(0.55f, 1.0f, 0.65f, 0.55f);
+    if (nearStation) {
+        glColor4f(1.0f, 0.75f, 0.25f, 0.8f);
+        glBegin(GL_LINES); glVertex3f(0, 0, PortFaceZ); glVertex3f(0, 0, HoldZ); glEnd();
+        glColor4f(0.45f, 0.9f, 1.0f, 0.65f);
+        glBegin(GL_LINE_STRIP);
+        for (int i = 0; i <= 60; ++i) { Vec3 p, f; shipPath(i / 60.0f, p, f); glVertex3f(p.x, p.y, p.z); }
+        glEnd();
+    }
+    // orbit rings. Both are circles around the EARTH, so they are drawn relative to the Earth's
+    // position in the station frame.
     glPushMatrix();
-    glMultMatrixf(Mat4::rotationX(SatTilt).m);
+    glTranslatef(earthLocal.x, earthLocal.y, earthLocal.z);
+    glLineStipple(3, 0x0F0F);
+    glColor4f(0.95f, 0.65f, 1.0f, 0.55f);                      // station orbit (magenta)
     glBegin(GL_LINE_LOOP);
-    for (int i = 0; i < 120; ++i) {
-        const float a = 2.0f * PI * i / 120;
-        glVertex3f(SatOrbitR * std::cos(a), 0, -SatOrbitR * std::sin(a));
+    for (int i = 0; i < 240; ++i) {
+        const float a = 2.0f * PI * i / 240;
+        const Vec3 p = (StationRadial0 * std::cos(a) + StationTangent0 * std::sin(a)) * StationOrbitR;
+        glVertex3f(p.x, p.y, p.z);
+    }
+    glEnd();
+    glColor4f(0.55f, 1.0f, 0.65f, 0.55f);                      // satellite orbit (green)
+    glBegin(GL_LINE_LOOP);
+    for (int i = 0; i < 240; ++i) {
+        const float a = 2.0f * PI * i / 240;
+        const Vec3 p = (SatA * std::cos(a) + SatB * std::sin(a)) * SatOrbitR;
+        glVertex3f(p.x, p.y, p.z);
     }
     glEnd();
     glPopMatrix();
     glDisable(GL_LINE_STIPPLE);
-    // range ticks along the corridor
-    glBegin(GL_LINES);
-    glColor4f(1.0f, 0.75f, 0.25f, 0.9f);
-    for (float z = PortFaceZ + 2.0f; z <= HoldZ; z += 2.0f) { glVertex3f(-0.3f, 0, z); glVertex3f(0.3f, 0, z); }
-    glEnd();
-    glColor3f(1.0f, 0.8f, 0.4f);
-    drawText3D(Vec3(0.5f, 0.3f, HoldZ), "hold point");
-    drawText3D(Vec3(0.5f, 0.3f, PortFaceZ), "port");
-    glColor3f(0.6f, 1.0f, 0.7f);
-    drawText3D(satPos + Vec3(0.0f, 1.3f, 0.0f), "satellite");
-    glDisable(GL_LINE_SMOOTH);
+    if (nearStation) {
+        // range ticks along the corridor
+        glBegin(GL_LINES);
+        glColor4f(1.0f, 0.75f, 0.25f, 0.9f);
+        for (float z = PortFaceZ + 2.0f; z <= HoldZ; z += 2.0f) { glVertex3f(-0.3f, 0, z); glVertex3f(0.3f, 0, z); }
+        glEnd();
+        glColor3f(1.0f, 0.8f, 0.4f);
+        drawText3D(Vec3(0.5f, 0.3f, HoldZ), "hold point");
+        drawText3D(Vec3(0.5f, 0.3f, PortFaceZ), "port");
+    }
+    // labels / markers
+    if (stationDist > 60.0f) drawMarker(Vec3(0, 0, 0), stationDist * 0.035f, 0.95f, 0.65f, 1.0f, "SPACE STATION", -1.9f);
+    if (satDist > 60.0f) {
+        drawMarker(satPos, satDist * 0.03f, 0.55f, 1.0f, 0.65f, "SATELLITE");
+    } else {
+        glColor3f(0.6f, 1.0f, 0.7f);
+        drawText3D(satPos + Vec3(0.0f, 1.3f, 0.0f), "satellite");
+    }
     glLineWidth(1.0f);
+    glDisable(GL_LINE_SMOOTH);
     glDisable(GL_BLEND);
     enableLighting();
 }
@@ -1750,14 +1856,13 @@ void drawGuides() {
 void updateSimulation(float dt) {
     simTime += dt;
     ringAngle = std::fmod(ringAngle + 6.0f * dt, 360.0f);
-    solarAngle = std::fmod(solarAngle + 20.0f * dt, 360.0f);
+    solarAngle = std::fmod(solarAngle + 20.0f * dt, 360.0f);      // satellite wings only
     earthSpin = std::fmod(earthSpin + 1.2f * dt, 360.0f);
-    satAngle = std::fmod(satAngle + 9.0f * dt, 360.0f);
+    satAngle = std::fmod(satAngle + SatOmega * dt, 360.0f);       // satellite orbit phase
+    stationAngle += StationOmega * dt;                            // station orbit phase
+    if (stationAngle >= 360.0f) { stationAngle -= 360.0f; ++stationOrbits; }
 
-    // solar wings turn smoothly toward the sun when tracking is on
-    const float sunTarget = degrees(std::atan2(-SunDir.y, SunDir.z));
-    solarTrackAngle += wrap180(sunTarget - solarTrackAngle) * (1.0f - std::exp(-dt * 1.5f));
-
+    updateStation();                  // must run before anything that converts world -> station frame
     updateSatellite();
     updateDocking(dt);
     updateShipFrame();
@@ -1958,7 +2063,7 @@ char screenshotPath[256] = "";
 int screenshotAfterFrames = -1;
 int frameCounter = 0;
 
-const char* const PresetNames[7] = {"", "ISOMETRIC", "DOCKING AXIS", "TOP", "AFT", "CHASE (SPACECRAFT)", "ROBOTIC ARM"};
+const char* const PresetNames[8] = {"", "ISOMETRIC", "DOCKING AXIS", "TOP", "AFT", "CHASE (SPACECRAFT)", "ROBOTIC ARM", "ORBIT OVERVIEW"};
 
 Vec3 orbitOffset(const CameraState& c) {
     const float cp = std::cos(radians(c.pitch)), sp = std::sin(radians(c.pitch));
@@ -1966,10 +2071,14 @@ Vec3 orbitOffset(const CameraState& c) {
 }
 
 void clampCamera(CameraState& c) {
+    const bool overview = (camPresetId == 7 && !labMode);       // orbit overview: centred on the Earth, far zoom range
     c.pitch = clampf(c.pitch, -88.0f, 88.0f);
-    c.dist = clampf(c.dist, labMode ? 4.0f : MinCamDist, MaxCamDist);
-    const float l = length(c.target);
-    if (l > 45.0f) c.target = c.target * (45.0f / l);
+    c.dist = clampf(c.dist, labMode ? 4.0f : (overview ? OverviewMinDist : MinCamDist),
+                    overview ? OverviewMaxDist : MaxCamDist);
+    if (!overview) {
+        const float l = length(c.target);
+        if (l > 45.0f) c.target = c.target * (45.0f / l);
+    }
 }
 
 // Leaving the chase camera: continue smoothly from wherever the chase camera currently is.
@@ -1998,6 +2107,13 @@ void setPreset(int id) {
         chaseEye = camEye; chaseTarget = camTarget; chaseUp = Vec3(0, 1, 0);
         break;
     case 6: camGoal.yaw = 30.0f;  camGoal.pitch = 25.0f; camGoal.dist = 11.0f; camGoal.target = Vec3(0, 3.6f, 3.0f); break;
+    case 7: {                                                    // look at the Earth from above the orbit plane
+        const Vec3 dir = normalize(StationNormal * -0.75f + StationRadial0 * 0.35f + StationTangent0 * 0.2f);
+        camGoal.yaw = degrees(std::atan2(dir.x, dir.z));
+        camGoal.pitch = degrees(std::asin(clampf(dir.y, -1.0f, 1.0f)));
+        camGoal.dist = 520.0f;
+        camGoal.target = earthLocal;
+        break; }
     default: break;
     }
     toast(PresetNames[id], 1.5f);
@@ -2015,6 +2131,7 @@ void updateCamera(float dt) {
         camEye = chaseEye; camTarget = chaseTarget; camUp = chaseUp;
         return;
     }
+    if (camPresetId == 7 && !labMode) camGoal.target = earthLocal;   // overview keeps the (moving) Earth centred
     const float k = 1.0f - std::exp(-dt * 9.0f);
     clampCamera(camGoal);
     cam.yaw += wrap180(camGoal.yaw - cam.yaw) * k;
@@ -2109,9 +2226,9 @@ void drawStationHUD() {
     static const char* const help[] = {
         "Mouse  L-drag orbit  R-drag/wheel zoom  M-drag pan",
         "Camera 1 iso  2 dock  3 top  4 aft  5 chase  6 arm",
-        "       arrows orbit   +/- zoom   R reset",
+        "       7 orbit view  arrows orbit  +/- zoom  R reset",
         "Sim    Space pause  N dock/undock  B reset",
-        "       P solar wings: free spin / track sun",
+        "Orbit  7 shows the station + satellite circling Earth",
         "Arm    A/D base   W/S shoulder   Q/E elbow",
         "       F/G wrist  C/V gripper    Z reset arm",
         "View   T transformation lab  L wireframe",
@@ -2120,7 +2237,7 @@ void drawStationHUD() {
 
     // telemetry (right)
     const float px = winW - 282.0f;
-    hudPanel(px, 12.0f, 270.0f, 214.0f);
+    hudPanel(px, 12.0f, 270.0f, 232.0f);
     glColor3f(0.55f, 0.85f, 1.0f);  hudText(px + 12.0f, 32.0f, med, "TELEMETRY");
     glColor3f(0.88f, 0.92f, 1.0f);
     float nearest = 1e9f;
@@ -2128,10 +2245,11 @@ void drawStationHUD() {
     const Vec3 tip = armToolPosition();
     float y = 52.0f;
     hudText(px + 12.0f, y, mono, "Sim time   %7.1f s", simTime);                       y += 15.0f;
-    hudText(px + 12.0f, y, mono, "Solar      %s", solarTracking ? "TRACKING SUN" : "FREE SPIN");  y += 15.0f;
+    hudText(px + 12.0f, y, mono, "Orbit      %3.0f deg  lap %d", stationAngle, stationOrbits + 1);  y += 15.0f;
+    hudText(px + 12.0f, y, mono, "Solar wing FIXED (face sun)");                        y += 15.0f;
     hudText(px + 12.0f, y, mono, "Ring spin  6.0 deg/s");                                y += 15.0f;
     hudText(px + 12.0f, y, mono, "Antenna    az %4.0f  el %3.0f", dishYaw, dishPitch);   y += 15.0f;
-    hudText(px + 12.0f, y, mono, "Satellite  phase %3.0f deg", satAngle);               y += 15.0f;
+    hudText(px + 12.0f, y, mono, "Satellite  orbit %3.0f deg", satAngle);               y += 15.0f;
     hudText(px + 12.0f, y, mono, "Debris     %d objs, min %.1f", (int)debris.size(), nearest);  y += 22.0f;
     glColor3f(1.0f, 0.75f, 0.35f);
     hudText(px + 12.0f, y, mono, "ROBOTIC ARM (deg)");                                  y += 15.0f;
@@ -2237,7 +2355,7 @@ void display() {
     gluLookAt(camEye.x, camEye.y, camEye.z, camTarget.x, camTarget.y, camTarget.z, camUp.x, camUp.y, camUp.z);
 
     const GLfloat sunPos[4] = {SunDir.x, SunDir.y, SunDir.z, 0.0f};
-    const Vec3 ed = normalize(EarthPos);
+    const Vec3 ed = normalize(earthLocal);                           // planet-shine comes from the Earth's current direction
     const GLfloat earthshine[4] = {ed.x, ed.y, ed.z, 0.0f};
     glLightfv(GL_LIGHT0, GL_POSITION, sunPos);                       // set after the view matrix: lights live in world space
     glLightfv(GL_LIGHT1, GL_POSITION, earthshine);
@@ -2394,11 +2512,10 @@ void keyboard(unsigned char key, int, int) {
         else if (k == 'r') { camGoal.yaw = 35.0f; camGoal.pitch = 24.0f; camGoal.dist = 13.0f; camGoal.target = Vec3(0, 0.3f, 0); }
         return;
     }
-    if (k >= '1' && k <= '6') setPreset(k - '0');
+    if (k >= '1' && k <= '7') setPreset(k - '0');
     else if (k == 'r') setPreset(1);
     else if (k == 'n') dockCommand();
     else if (k == 'b') resetDocking();
-    else if (k == 'p') { solarTracking = !solarTracking; toast(solarTracking ? "Solar wings track the sun" : "Solar wings spinning freely", 1.8f); }
     else if (k == 'z') { arm = ArmHome; toast("Robotic arm reset", 1.2f); }
 }
 
@@ -2437,7 +2554,8 @@ void motion(int x, int y) {
     lastMouseX = x; lastMouseY = y;
     if (dragButton < 0) return;
     leaveChase();
-    camPresetId = 0;
+    // the orbit overview keeps tracking the Earth while you rotate/zoom; panning leaves it
+    if (!(camPresetId == 7 && dragButton != GLUT_MIDDLE_BUTTON)) camPresetId = 0;
     if (dragButton == GLUT_LEFT_BUTTON) {
         camGoal.yaw -= dx * 0.4f;
         camGoal.pitch += dy * 0.4f;
@@ -2455,7 +2573,7 @@ void motion(int x, int y) {
 
 void mouseWheel(int, int dir, int, int) {
     leaveChase();
-    camPresetId = 0;
+    if (camPresetId != 7) camPresetId = 0;
     camGoal.dist *= std::pow(0.9f, (float)dir);
     clampCamera(camGoal);
 }
@@ -2515,9 +2633,9 @@ void initGL(bool multisample) {
     initDebris();
     probe.scale = 0.9f;
     labEnterDemo(0);
+    updateStation();          // station first: the satellite frame is expressed relative to it
     updateSatellite();
     updateShipFrame();
-    solarTrackAngle = degrees(std::atan2(-SunDir.y, SunDir.z));
     cam = camGoal;
     camTarget = cam.target;
     camEye = cam.target + orbitOffset(cam);
@@ -2542,7 +2660,7 @@ int main(int argc, char** argv) {
     //   --preset N   --lab N   --dock   --skip SECONDS   --shot FRAMES FILE.bmp
     float skipSeconds = 0.0f;
     for (int i = 1; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--preset") && i + 1 < argc) { camPresetId = std::atoi(argv[++i]); if (camPresetId >= 1 && camPresetId <= 6) setPreset(camPresetId); }
+        if (!std::strcmp(argv[i], "--preset") && i + 1 < argc) { camPresetId = std::atoi(argv[++i]); if (camPresetId >= 1 && camPresetId <= 7) setPreset(camPresetId); }
         else if (!std::strcmp(argv[i], "--lab") && i + 1 < argc) { enterLab(true); labEnterDemo(std::atoi(argv[++i]) - 1); }
         else if (!std::strcmp(argv[i], "--dock")) dockCommand();
         else if (!std::strcmp(argv[i], "--skip") && i + 1 < argc) skipSeconds = (float)std::atof(argv[++i]);
